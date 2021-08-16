@@ -1,0 +1,37 @@
+Par New+CMS
+进行ygc的时候,如果eden区中还有1个2m的对象和一个500k的对象存活,而在回收时发现survivor只有1m的空间,那么500k的对象会进入survivor
+那个2m的对象会直接进入老年代
+
+要优化jvm gc,重点就在于尽量不要让对象进入老年代
+1.评估并发量,平均每个任务处理所需的内存大小,评估需要多少台机器,每台机器需要多大的内存
+2.根据系统的任务处理速度,评估内存使用情况,然后合理分配eden,survivor,老年代的大小.
+
+总体原则:让对象在YGC时就被回收掉,不要进入老年代,长期存活的对象使其直接进入老年代,避免复制来复制去浪费处理时间.
+对系统响应敏感且内存需求大的,建议采用G1.
+
+根据内存增速来评估多久进行以此YGC,
+根据每次YGC的存活,评估一下Survivor的大小设置是否合理.
+评估多久进行以此FULL GC,STW时间是否可以接受
+
+随着流量增加,负载增加10倍,100倍
+1.同比增加机器数量,机器配置不变,可以保持jvm配置不变
+2.使用更高的机器配置,如果对响应时间敏感,内存配置提高很多的话,可以考虑使用G1
+
+jvm参数配置应当加入-XX:DisableExplicitGC,禁止显示GC,即禁止在代码中调用System.gc();
+
+在cms的重新标记前触发一次YGC,减少年轻代的对象,有助于提升CMS重新标记阶段的性能.因为年轻代可能有对象和老年代有引用关系,扫描的时候可能会扫到年轻代去
+
+触发FullGc的情景:
+1.每次YGC后,存活的对象很多,快速填满old区
+2.大对象很多,都直接进入old
+3.metaspace被快速填满--加载类太多
+4.类存泄露
+5.调用System.gc()
+
+-XX:NewSize=5242880 -XX:MaxNewSize=5242880 -XX:InitialHeapSize=10485760 -XX:MaxHeapSize=10485760 -XX:SurvivorRatio=8 
+-XX:PretenureSizeThreshold=10485760 -XX:+UseParNewGC -XX:+UseConcMarkSweepGC -XX:+PrintGCDetails -XX:+PrintGCTimeStamps -Xloggc:gc.log
+
+
+-XX:NewSize=10485760 -XX:MaxNewSize=10485760 -XX:InitialHeapSize=20971520 -XX:MaxHeapSize=20971520 -XX:SurvivorRatio=8
+ -XX:MaxTenuringThreshold=15 -XX:PretenureSizeThreshold=10485760 -XX:+UseParNewGC -XX:+UseConcMarkSweepGC -XX:+PrintGCDetails 
+ -XX:+PrintGCTimeStamps -Xloggc:gc.log

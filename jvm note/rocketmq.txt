@@ -1,0 +1,217 @@
+RocketMq的broker发送消息时会定时进行同步
+消息通过netty发送到broker
+
+commitlog采用磁盘文件顺序写+osPageCache写入+os异步刷盘的策略,磁盘顺序写比随机写的效率要高很多
+
+
+rocket只支持固定精度的延迟消息,不让用户自定义是怕消息入队列时的排序会消耗过多时间
+
+通过jvm的钩子函数的来关闭线程池
+1.用户态的线程可能阻止JVM的关闭   !待验证
+2.在JVM关闭之前,执行完线程池中已经在进行中的线程
+               
+RocketMq如果要配置集群,那么配置文件以及存储文件等等都必须在不同目录下
+如果brokername一样,后面启动的即使不在同一个端口,也会覆盖掉之前的broker
+
+
+高并发场景解决方案
+1.前端DNS解析/软硬负载均衡设施进行分流/限流
+2.缓存的业务维度拆分
+3.微服务流控(guava RateLimiter/jdk semaphore/hystrix/sentinel
+4.微服务熔断/降级/兜底(动态调整阈值/降级兜底策略等)
+5.微服务接口的幂等性保障(比如用户下单后,下游做扣库存,如果扣库存超时,那么如果重发请求,不能造成重复扣库存.. 可以使用redis分布式锁做消息id去重)
+6.数据库分库分表策略(设计契合业务的纬度,利用合适的负载均衡算法)
+7.冷热数据/读写分离
+8.对有效业务数据的过滤与业务的解耦
+9.顺序消息机制,保障局部顺序并行化处理消息
+10.分布式事务,将A,B账户操作进行高度解耦
+
+
+业务上对大概率事件进行预判,小概率事件做最终保障
+
+支付流程的多重保障:
+1.用一个token防止接口重复提交
+2.获取分布式锁保障并发安全
+3.预防到redis服务全部失效的情况,正常大公司如支付宝这种不可能因为拿不到分布式锁就放弃订单的支付,因此redis之后还要继续做校验
+4.数据库乐观锁保障
+
+事务消息消费
+事务消息保证的是本地事务与消息发送形成整体的原子性,而投递到MQ服务器后,消费者的消费是无法保证的
+1.service类将消息打包好
+2.通过TransactionProducer发送消息:
+	给消息打上事务消息相关的标记,用于MQ服务端区分普通消息和事务消息
+	发送半消息(half meesage)
+	发送成功则由transactionListener执行本地事务
+	如果半消息发送失败,则告知服务端删除半消息
+3.然后自定义实现TransactionListener接口,在transactionLisitener里有两个方法,一个是做本地事务逻辑处理,一个是本地事务执行状态回调检测
+	如果本地事务执行成功则告诉服务端生效半消息,失败则删除半消息
+	如果本地事务执行返回的是UNKNOWN(或者网络问题等等,服务端没收到本地事务执行结果),则checkLocalTransaction对执行结果进行回查,然后返回执行结果
+
+
+
+顺序消息消费
+顺序消息需要生产端和消费端两端配合保证
+比如多商家的情况下,处理订单,有些商家很火爆,订单很多,有些商家订单很少,如果1号商家秒杀了30w个订单,
+按顺序消费的话那后面的其他商家的订单都得等着这家消费完才可以,那对其他商家肯定不公平
+这种情况可以一个topic分多个messageQueue,通过MessageQueueSelector指定queue,比如分1k个,按门牌号分
+
+非即时性的请求可以异步处理,只返回即时性的处理结果
+即时性场景要求快速成功/快速失败,不能主动做补偿兜底处理
+异步处理的消息才需要考虑全面补偿与兜底处理
+
+
+消息过滤
+Tag方式  效率最高
+Sql表达式  需要解析,效率低  需要broker配置文件开启enablePropertyFilter=true
+filter server  效率高,但加大了broker的工作量,以cpu资源换取网络流量资源  4.3.x以后已被废弃
+
+提升吞吐量
+1.提高Consumer处理能力,增加机器或者提高机器配置(就可以增加Consumer内部线程并行度)
+2.批量消费(consumerMessageBatchMaxSize)批量消费提高效率的点在于批量ack,正常消息是一条一条ack,这样降低了ack的资源消耗,要单独对每一条消息ack,否则会整体报错
+3.topic下的队列个数应该与consumer数量契合,一般情况下单点服务器8-16个比较合适
+4.生产者发送oneway消息(不需要等待ack),在不需要保证消息可靠性的情况下可以用
+5.多生产者同时发送消息(多线程会将消息并发写到directMemory,再刷盘)
+6.操作系统级别的调优,文件系统使用ext4/io调度算法使用deadline算法,(一台机器专门用于rocketmq的部署,会对文件进行频繁创建读写)
+
+
+双主双从  
+同步双写,消息无延迟,数据可靠性高,发送消息的rt会略高,性能大约比异步降低10%左右,master宕机后,slave没法自动切换为master
+
+
+RocketMq消息存储
+千万级以下可以用关系型数据库存取,超过这个就最好用文件系统了,因此rocketmq是直接存文件系统的
+在高性能磁盘上,顺序写和随机写性能最高差6000倍,顺序写速度最高可达600M/s
+消息发送
+服务器发送到网络进行了4次数据复制
+1.从磁盘复制到内核态
+2.内核态到用户态
+3.用户态到网络驱动内核态
+
+rocketmq不支持自定义延迟时间精度,且最大时长只有两小时,原理是采用一个线程池每隔10s对优先队列进行一次轮询,如果拿出首部节点发现到时间了就执行
+kafaka的原理是多层时间轮
+对于有自主需要的延迟消息需求,可以自定义一个delayServer,可以将消息发送到delayServer,然后在delayServer里做时延,再发送(时间轮是个很不错的东西)
+复用rocketmq的接口,直接复用消息发送接口,将带有延迟信息数据的消息发送到一个特定Topic,然后delayServer再特殊处理这个topic的的消息,
+实现自定义的业务需要
+
+有定制化需求也不建议直接在原rocketmq上改动,除非有一支庞大的团队做技术支持,不然经过大的改动以后,很难适应rocketmq之后的升级,会错过rocketmq升级的技术红利
+
+1.直接加机器,master的id要设置为0,slave的id大于0,统一由namesrv调控
+2.主从同步一般采用同步复制,异步刷盘.这样保证主从之间的最大可能的数据安全,保证数据不会丢失,同时不影响写入磁盘的效率
+3.生产者通过namesrv的调度来选择发送到哪一个broker,有一个负载均衡策略
+4.在namesrv里存储了多个map,有broker->topic的映射,也有broker的集合,里面存储了broker以及topic的路由地址及详细信息
+5.broker有30s心跳检测,10s扫描-->120s故障感知
+
+压测应该先调整os内核参数,JVM参数以及中间件核心参数
+os内核参数主要是跟磁盘IO,网络通信,内存管理以及线程管理有关,需要适当调节大小
+JVM参数需要在rocket的启动脚本中去寻找默认的JVM参数,然后根据机器的情况,对JVM堆内存大小,新生代大小,Direct Buffer大小等等做出一些调整,不要浪费机器资源
+rocket核心参数主要也是关注其中跟网络通信,磁盘IO,线程数量,内存管理相关.适当可以增加网络通信线程,控制同步或异步刷盘策略,应用内部线程池的数量,队列的大小
+
+压测应该在TPS和cpu负载,内存使用率,jvm gc频率,磁盘IO负载,网络流量均衡负载之间取得一个平衡.尽量让TPS提高,同时让机器的各项资源负载不要太高
+实际压测:
+	采用几台机器开启大量线程读写消息,然后观察TPS,cpu load,内存使用率(使用free命令),jvm gc频率,磁盘IO负载(top),网卡流量负载(sar),不断增加机器和线程,
+让TPS不断升上去同时观察各项资源的负载情况
+
+消息的分布式存储:
+	通过topic的多个MessageQueue在不同的broker上,这样就实现了分布式存储
+	建议默认开启生产者的sendLatencyFaultEnable,这是开启容错机制,在一个Topic的多个MessageQueue分布在多台broker上的时候,如果一台broker宕机了,在slave切换到
+master的这个过程中是无法提供服务的,开启容错机制能够避免消息频繁的发送到故障的broker上去,会在设定的时间之后再去重新访问
+	消息发送过来是写入commitlog文件(最大1G,达到了就写入新的commitlog文件),然后每个topic下的MessageQueue下会有很多的ConsumeQueue,ConsumeQueue文件里存储的是一条消息对应在commitlog文件中
+offset的偏移量.ConsumeQueue文件大小每个5.72M左右,offset即实际消息在commitlog的实际物理位置.
+
+Topic分布在多台broker上,对于发送到一个topic的多条消息默认是按平均分配的方式分配到不同的broker
+
+Broker集群通过DLedger实现主从自动切换
+DLedger核心是raft协议,在选举master时如果第一轮没有得出结果,那所有参与者随机休眠一定的时间,先苏醒过来的人会投票给自己,然后转发给其他人,其他人苏醒之后
+发现自己收到选票了,就会直接投票给那个人,依靠这个机智,基本几轮过后就可以快速选举出一个leader
+
+DLedger有个commitlog机制,基于DLedger的高可用架构就是用DLedger替换掉原来broker自己管理的commitlog,由DLedger自己来管理
+
+DLedger基于raft协议进行多副本数据同步
+数据同步会分为两个阶段,UnCommited和Commited
+首先Leader Broker的DLedger收到一条消息后会把消息标记为UnCommited状态,然后会通过DLedgerServer组件把这个Uncommited的数据发送给Follower Broker的
+DLedgerServe,然后Follower broker收到uncommited消息之后,必须返回一个ack给Leader Broker的DLdgerServer,然后如果leader的DLedger收到超过半数的Follower
+Broker返回ack之后,就会将消息标记为committed的状态,然后leader的DLedger再把committed消息发送给follower,让他们也把消息标记为committed
+
+DLedger对于tps的影响很大,在4.8优化以后,DLegdger的发送tps也只有非DLedger的一半.比如普通模型6w,DLedger只有3w
+4.8以前,提交消息需要同步阻塞等待半数follower的ack才能返回,极大影响了吞吐量.4.8以后将ack的动作异步化,提升了很多.
+
+消费者拉取消息的时候会频繁读取consumeQueue文件,而consumeQueue文件因为保存的是每条消息的offset所以文件很小,因此通常是整个consumeQueue文件都缓存在os cache中,
+这样就几乎跟访问内存一样,通过这个可以保证数据消费的高性能及高吞吐.
+CommitLog是基于os cache+磁盘一起读取的
+一个CommitLog文件是很大的,因此不可能将所有的commitlog文件的内容放进os cache中,在数据写入commitlog中的时候,新写入的肯定是优先在os cache里的,老的数据就
+会被慢慢刷到磁盘中去,因此消费者来拉取消息的时候,如果读的是最近的消息就可能在内存中,老的就可能在磁盘中.
+如果消费机器一直在快速的拉取和消费处理,紧紧跟着生产者写入broker的写入速率,那么每次拉取都近乎是在os cache中读取数据
+但是如果broker的负载很高,导致拉取消息的速度很慢,或者消费者拉取消息后处理速率很慢,这会导致消费速率跟不上生产速率.
+这就导致每次消费者去拉取消息都是拉取之前的消息,且延时会越来越高,直到造成每次拉取消息都会是在磁盘中拉取.
+Master什么时候会让消费者去slave拉取数据:
+	假设broker此时写入了10w数据,但消费者只拉取了2w,而broker只能放5w条消息在内存中,此时还有8w条没消费,那么下次来拉取消息,broker发现你还有8w条没拉取,
+而broker计算出自己的内存只够放5w条,那么有3w条是必定在磁盘中的,经过这样的判断之后,broker会认为是自己作为master broker负载太高了,导致没法及时把消息给
+消费者,这个时候broker就会把3w条消息从磁盘里给消费者,然后告诉消费者下次去slave拉取消息
+
+Rocket在broker端基于Netty的网络通信模型
+1.Reactor主线程监听网络请求并进行分发
+2.Reactor线程池监听Reactor主线程分发过来且已经建立好网络连接
+3.Worker线程池对多个请求进行并发预处理
+4.业务线程池并发的对多个请求进行磁盘读写业务操作
+
+Rocket就是基于mmap来实现commitlog这种大磁盘文件的高性能读写优化的
+传统读取文件  磁盘-->拷贝到内核IO缓冲区-->拷贝到用户态私有进程
+mmap是通过jdk的NIO包下的MappedByteBuffer.map()建立一个磁盘到用户进程私有空间的虚拟内存地址的映射
+读取文件时先看pagecache里有没有,没有就把文件从磁盘中加载到pageCache中,再去读,这样就相当于只拷贝了一次
+写入数据时,也是先写入pageCache,然后再从pageCache写入磁盘
+
+Broker通过mmap的优化: 预映射机制+文件预热机制
+1.预映射机制:Broker会针对磁盘上的各种commitLog,ConsumeQueue文件预先分配好MappedFile,也就是提前对一些可能接下来要进行读写的磁盘文件,提前使用
+MappedByteBuffer执行map()完成映射,这样后续读写时就可以直接执行
+2.文件预热:再提前对一些文件完成映射后,因为映射不会直接将数据加载到内存当中,那么后续在读取commitLog,ConsumeQueue的时候,就有可能会频繁的从磁盘加载数据到
+内存,所以在执行完map()之后,会进行madvise系统调用,提前将尽可能多的文件加载到内存当中去
+所以总结broker对磁盘文件的读写就是基于mmap通过预映射和预热机制尽可能的将磁盘文件加载到内存,使读取这些文件的时候尽可能从内存中读取.
+
+疑问:
+到了部分broker,如果过半了那就意味着可以ack了,即使是同步,那么ack以后
+master肯定会通知hold住的请求来消息了,而如果master负载很高,要消费者去
+slave拉取,而导向的那个slave正好消息此时还没同步过来,那怎么处理?会不会出现这种情况?
+
+事务消息:
+事务消息第一次发送的half消息是发给内部topic的,而不是指定topic,只有在后续commit之后,才会从内部topic转向指定的Topic
+half消息在收不到生产者的回应时,会回调生产者的接口去确认状态,如果超过15次都确认不了状态,就会rollback.
+
+处理顺序消息:
+比如说数据库的sql的时候,普通消息如果遇到异常一般是return一个RECONSUME_LATER的一个状态,但是数据库的这种肯定是不行的,因为sql执行顺序决不能有更改,
+如果处理消息异常应该返回SUSPEND_CURRENT_QUEUE_A_MOMENT,让消费者等一会再继续处理这批消息,而不是丢进重试队列.
+
+
+Broker启动过程:
+1.创建Broker实例
+	1.接收来自启动时命令行的一些参数,解析并配置
+	2.初始化broker,nettyClient,nettyServer默认的配置信息
+	3.判断broker的角色(master or slave),作不同的处理
+	4.判断是否启用DLeger
+	5.初始化broker:
+		1.从磁盘中加载配置信息
+		2.初始化各种工作线程池,如接收消息线程池,消费者拉取消息线程池等等
+		3.启动各种定时任务,如持久化消费者消费消息的offset,进行落后的commitlog分发等等
+2.启动broker
+	1.启动各种相关组件,如存储消息组件,nettyServer组件,broker发送心跳的组件等等.
+	2.向namesrv注册broker.
+	
+Broker注册过程:
+	1.遍历所有的namesrv信息
+	2.配置好请求数据,封装一个请求实例
+	3.调用remotingClient的invokeOneWay进行注册
+	
+Broker在将数据写入commitlog以后,会有一个后台线程每隔一毫秒会将数据转发到comsumeQueue和indexFile(保存消息的key和offset,便于用key查找)
+
+
+
+
+
+
+
+
+
+
+
+
+
+

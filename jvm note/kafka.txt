@@ -1,0 +1,2 @@
+Kafka
+发送消息基于batch和request机制,内部维护有一个batch缓冲池,通过这个来减少gc的频率

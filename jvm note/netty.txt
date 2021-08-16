@@ -1,0 +1,74 @@
+Netty
+
+1.线程模型 Reactor
+单线程模型  new NioEventLoopGroup(1)
+多线程模型	new NioEventLoopGroup(),不设置参数,默认线程数是核数的2倍
+主从多线程模型   
+	先实例化一个NioEventLoopGroup作为一个bossGroup,再实例化新的EventLoopGroup作为workerGroup
+	Boss处理客户端请求接入,Worker负责数据读取,I/O事件的分发与执行
+	任务处理线程:用于执行普通任务或定时任务,如空闲连接检测,心跳上报等.
+	
+	
+
+2.EventLoop
+1.NioEventLoop无锁串行化设计
+BossEventLoopGroup负责监听客户端的Accept事件,当事件触发时,将事件注册到WorkerEventLoopGroup中的一个EventLoop上,每新建一个channel,
+只选择一个EventLoop与其绑定,所以channel生命周期的所有事件处理都是线程独立的,不同的eventLoop之间不会有任何交集.
+EventLoop读取完数据之后,会调用绑定的ChannelPipeline进行事件传播,在ChannelPipeline的channelHandler中处理数据的时候,是链式执行的,也就是串行化,
+线程安全,不会发生线程上下文切换的问题
+2.EventLoop解决jdk的epoll空轮询问题
+在jdk中,epoll的实现,即使Selector轮询的事件列表为空,NIO线程一样可以被唤醒,导致CPU100%占用.
+Netty是通过一种检测机制来规避空轮询问题,每次执行select操作之前记录当前的时间,如果事件轮询的持续时间大于等于timeoutMills,那么说明是正常的,
+否则表明阻塞时间未达到预期,可能触发了空轮询bug,Netty在这里引入了一个计数器selectCnt,正常情况下selectCnt会被重置,否则会+1,当selectCnt达到
+SELECTOR_AUTO_REBUILD_THRESHOLD(默认值512)时,会触发重建Selector对象
+
+
+3.ChannelPipeline
+每个Channel会绑定一个ChannelPipeline,ChannelPipeline可以看作是ChannelHandler的容器载体,由一组ChannelHandler实例组成,内部通过双向链表将不同的
+ChannelHandler连在一起,当有I/O读写事件触发时,ChannelPipeline会依次调用ChannelHandler链路对Channel的数据进行拦截和处理.
+ChannelPipeline分入站ChannelInboundHandler 和出站ChannelOutBoundHandler两种处理器.
+ChannelPipeline包含HeadContext和TailContext,HeadContext既是InHandler也是OutHandler,自定义的ChannelHandler会插入到Head和Tail之间.
+TailContext会在ChannelInboundHandler的最后一步执行,主要用于终止Inbound事件传播,例如释放Message数据资源等.
+事件传播机制:Inbound传播顺序是和添加顺序一致,而Outbound传播顺序与添加顺序相反
+异常传播机制:在ChannelPipeline的调用链中,如果有一个节点出现异常,那么异常会传播到最尾节点,(与什么事件In/Out无关,传播顺序跟添加顺序一致)
+因此自定义的异常处理器应添加在自定义处理器的末端.
+
+4.消息编解码
+消息编码器继承ChannelOutBoundHandlerAdapter
+消息解码器继承ChannelInBountHandlerAdapter
+
+消息解码器
+1.固定长度解码器
+每隔多长就解码一次,不管这个包有没有结束
+2.固定分隔符解码器
+按分隔符来解码,可以设置过长报错字段,避免极端情况数据过长
+3.长度域解码器  (RocketMq就是基于此)
+最常用的解码器,解析长度域字段,得到数据长度,然后按这个长度解码数据内容
+长度域字段可能出现在报文中的任何位置,因此需要定义好长度域字段的起始位置以及结束位置
+有时长度域字段的值可能不只是纯数据的长度,可能包含的是整个报文的长度或者数据加上一些其他字段的长度,这时就需要对报文值的长度进行一个调整(lengthAdjustment)
+initialBytesToStrip主要用来截断解码后的内容,正常解码后包含的是整个报文的内容,如果只需要消息内容,那么可以从消息开始的位置开始截断
+
+
+Netty在进行I/O操作时都是使用的堆外内存,可以避免数据从JVM堆内存到堆外内存的拷贝
+如果在JVM内部执行I/O操作时,必须将数据拷贝到堆外内存,才能执行系统调用.这是所有VM语言都会存在的问题。不直接使用JVM堆内存进行I/O读写有两点原因：
+1.操作系统并不感知JVM的堆内存，而且JVM的内存布局与操作系统所分配的是不一样的，操作系统并不会按照JVM的行为来读写数据。
+2.同一个对象的内存地址随着JVM的GC的执行可能会随时发生变化，例如GC时进行压缩来减少内存碎片，这就涉及到了对象的移动。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
