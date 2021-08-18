@@ -14,6 +14,80 @@ Protocol拿到真实的接口ref,经由
 
 
 
+dubbo在producer端可以配置
+
+timeout超时时间  retryTimes重试次数  loadBalance负载均衡策略  actives并发度限制
+
+
+
+负载均衡策略有4种
+
+random 按权重随机
+
+round robin 轮询
+
+leastActive 最少调用优先,同级随机
+
+consistentHash  一致性hash,同样参数的每次发往同一台节点
+
+
+
+dubbo的服务宕机剔除是基于zookeeper的临时节点原理
+
+
+
+读服务建议使用failover,失败自动切换,默认重试两次其他服务器
+
+写操作建议使用failfast快速失败,发一次调用失败就立即报错
+
+
+
+dubbo会对结果进行自动缓存,用于加速热门数据的访问
+
+
+
+dubbo的同步调用是阻塞的
+
+
+
+dubbo兼容旧版本服务,通过版本号不同区分,同时上线多版本的服务
+
+
+
+当一个接口有多种实现时,可以用group属性来区分,服务方和消费方指定同一个group即可
+
+
+
+允许点对点直连,直接测试某一个服务
+
+
+
+容错方案设置
+
+Failover失败自动切换其他服务器
+
+Failfast快速失败,立即报错
+
+Failsafe失败安全,忽略出现的异常
+
+Failback失败自动恢复,记录请求,定时重试
+
+Forking并行调用多个服务,只要有一个成功即返回
+
+
+
+默认序列化采用Hessian,还有dubbo,fastjson,serialize
+
+
+
+dubbo默认使用zookeeper作为注册中心,还有redis,Multicast,simple注册中心,但不推荐使用
+
+
+
+dubbo内置了spring,jetty,log4j 服务容器
+
+
+
 
 
 
